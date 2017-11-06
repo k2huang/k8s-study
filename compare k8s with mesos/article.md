@@ -1,4 +1,4 @@
-# 对Kubernetes与Mesos做一次比较
+# 对Kubernetes和Mesos做一次比较
 
 ### 1. 为何而生
 ![](images/resource.jpg)<br/>
