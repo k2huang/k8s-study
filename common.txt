@@ -1,0 +1,281 @@
+=== feature gate ===
+kube_features.go
+
+=== 经典代码 ===
+### pkg/kubelet/kubelet.go
+  nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if kubeDeps.KubeClient != nil {
+		fieldSelector := fields.Set{api.ObjectNameField: string(nodeName)}.AsSelector()
+		nodeLW := cache.NewListWatchFromClient(kubeDeps.KubeClient.CoreV1().RESTClient(), "nodes", metav1.NamespaceAll, fieldSelector)
+		r := cache.NewReflector(nodeLW, &v1.Node{}, nodeIndexer, 0)
+		go r.Run(wait.NeverStop)
+	}
+  nodeInfo := &predicates.CachedNodeInfo{NodeLister: corelisters.NewNodeLister(nodeIndexer)}
+
+
+### pkg/kubelet/config/apiserver.go
+  lw := cache.NewListWatchFromClient(c.CoreV1().RESTClient(), "pods", metav1.NamespaceAll, fields.OneTermEqualSelector(api.PodHostField, string(nodeName)))
+  send := func(objs []interface{}) {
+		var pods []*v1.Pod
+		for _, o := range objs {
+			pods = append(pods, o.(*v1.Pod))
+		}
+		updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.ApiserverSource}
+	}
+	r := cache.NewReflector(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), 0)
+	go r.Run(wait.NeverStop)
+
+### 自建informer对象
+	slm.podStore.Indexer, slm.podController = cache.NewIndexerInformer(
+		&cache.ListWatch{
+			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
+				return slm.kubeClient.Core().Pods(api.NamespaceAll).List(options)
+			},
+			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
+				return slm.kubeClient.Core().Pods(api.NamespaceAll).Watch(options)
+			},
+		},
+		&v1.Pod{},
+		// resync is not needed
+		0,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    slm.enqueuePod,
+			UpdateFunc: slm.updatePod,
+		},
+		cache.Indexers{},
+	)
+
+	slm.endpointsStore, slm.endpointController = cache.NewInformer(
+		&cache.ListWatch{
+			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
+				return slm.kubeClient.Core().Endpoints(api.NamespaceAll).List(options)
+			},
+			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
+				return slm.kubeClient.Core().Endpoints(api.NamespaceAll).Watch(options)
+			},
+		},
+		&v1.Endpoints{},
+		// resync is not needed
+		0,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    slm.enqueueEndpoint,
+			UpdateFunc: slm.updateEndpoint,
+			DeleteFunc: slm.enqueueEndpoint,
+		},
+	)
+
+func NewPodInformer(client clientset.Interface, resyncPeriod time.Duration) coreinformers.PodInformer {
+	selector := fields.ParseSelectorOrDie(
+		"status.phase!=" + string(v1.PodSucceeded) +
+			",status.phase!=" + string(v1.PodFailed))
+	lw := cache.NewListWatchFromClient(client.CoreV1().RESTClient(), string(v1.ResourcePods), metav1.NamespaceAll, selector)
+	return &podInformer{
+		informer: cache.NewSharedIndexInformer(lw, &v1.Pod{}, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}),
+	}
+}
+
+	podListWatch := cache.NewListWatchFromClient(kubeclient.CoreV1().RESTClient(), "pods", metav1.NamespaceAll,
+		fields.OneTermEqualSelector(PodNodeNameField, nodeID))
+	podInformer := cache.NewSharedIndexInformer(podListWatch, &corev1.Pod{}, ResyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+
+=== finalizers === 
+1. 包含finalizers的delete只会将deletionTimestamp在第一次delete时设置上，之后的多次重复delete操作直接返回成功，
+informer只有第一次会收到watch event通知, 而且是update event(因为设置了deletionTimestamp).
+2. 每删除一个finalizer会触发一次update event, deletionTimestamp也会跟着被update
+3. 最后一个finalizer被清除时会触发delete event
+
+
+=== RateLimitingInterface 工作队列 ===
+包含组件：
+1. DelayingInterface 延时指定时间加入一个元素到队列中(可防止hot-loop)
+   通过优先队列将延时时间已到的元素放入队列中(队列中的元素即为可以处理的元素 - controller can get and sync)
+2. RateLimiter
+   ItemExponentialFailureRateLimiter
+   ItemFastSlowRateLimiter
+   MaxOfRateLimiter
+   BucketRateLimiter
+操作流程：
+1. 通过 [workqueue.Add] 将元素直接添加到队列中，元素可被controller马上处理，通常有informer注册的EventHandler来执行
+2. [workqueue.Get] 从队列中取元素，队列为空则cond.Wait
+3. controller在sync的过程中出现错误，然后通过 [workqueue.AddRateLimited] 尝试将失败元素重新放回队列中，此时
+延时多久再放回队列由RateLimiter控制("限速")，并通过DelayingInterface.AddAfter来实施
+  // AddRateLimited AddAfter's the item based on the time when the rate limiter says its ok
+  func (q *rateLimitingType) AddRateLimited(item interface{}) {
+    q.DelayingInterface.AddAfter(item, q.rateLimiter.When(item))
+  }
+4. [workqueue.Forget] Forget indicates that an item is finished being retried.  Doesn't matter whether it's for perm failing
+	 or for success, we'll stop the rate limiter from tracking it.  This only clears the `rateLimiter`, you
+	 still have to call `Done` on the queue.
+5. [workqueue.Done] 从工作队列中删除元素
+
+// Type is a work queue (see the package comment).
+type Type struct {
+	// queue defines the order in which we will work on items. Every
+	// element of queue should be in the dirty set and not in the
+	// processing set.
+	queue []t
+
+	// dirty defines all of the items that need to be processed.
+	dirty set
+
+	// Things that are currently being processed are in the processing set.
+	// These things may be simultaneously in the dirty set. When we finish
+	// processing something and remove it from this set, we'll check if
+	// it's in the dirty set, and if so, add it to the queue.
+	processing set
+
+	cond *sync.Cond
+
+	shuttingDown bool
+
+	metrics queueMetrics
+}
+问题
+1. 同一个api对象先后两次达到队列的并发处理结果？
+   First After Add and Before Get: 后到达的元素无法进入dirty和queue
+   First After Get and Before Done: 后达到的元素会进入dirty, 但无法进入queue，等前一个元素done的时候会将后一个元素再放入queue中
+   First After Done: 按正常逻辑处理
+2. 对一个api对象3次以及以上修改，第一次为调用done之前，只有第二个在dirty中，第三个直接丢失了？等待第一个对象处理完之后，第二个对象如果能拿到最新的value，即使
+第三次丢了也没有关系
+
+=== SharedIndexInformer ===
+0. 构建Informer，一种api类型需要new一个informer实例
+  defaultInformer
+  NewSharedIndexInformer
+    sharedIndexInformer {
+      	indexer    Indexer
+	      controller Controller
+	      processor  *sharedProcessor
+        listerWatcher ListerWatcher
+	      objectType    runtime.Object
+    }
+
+1.注册EventHandler，每注册一个ResourceEventHandler对应一个processorListener，会启动一对Goroutine来处理event
+  func (s *sharedIndexInformer) AddEventHandler(handler ResourceEventHandler) 
+    func (s *sharedIndexInformer) AddEventHandlerWithResyncPeriod(handler ResourceEventHandler, resyncPeriod time.Duration)
+      newProcessListener
+      s.processor.addListener
+        go listener.run
+          for next := range p.nextCh {
+            p.handler.OnAdd/OnUpdate/OnDelete
+          }
+        go listener.pop
+          <-p.addCh
+          p.nextCh<- 
+2.启动Informer
+  func (s *sharedIndexInformer) Run(stopCh <-chan struct{})
+    fifo := NewDeltaFIFO(MetaNamespaceKeyFunc, s.indexer)
+    cfg := &Config{
+      Queue:            fifo,
+      ListerWatcher:    s.listerWatcher,
+      ObjectType:       s.objectType,
+      FullResyncPeriod: s.resyncCheckPeriod,
+      RetryOnError:     false,
+      ShouldResync:     s.processor.shouldResync,
+
+      Process: s.HandleDeltas,
+	  }
+    s.controller = New(cfg)
+    s.processor.run
+    s.controller.Run
+      func (c *controller) Run(stopCh <-chan struct{})
+        r := NewReflector(
+          c.config.ListerWatcher,
+          c.config.ObjectType,
+          c.config.Queue,
+          c.config.FullResyncPeriod,
+        )
+        go r.Run
+          r.ListAndWatch
+            r.watchHandler
+              r.store.Add/Update/Delete  // 这里的store就是上面的增量队列 NewDeltaFIFO fifo，存在内存中
+        c.processLoop
+          c.config.Queue.Pop(PopProcessFunc(c.config.Process)) // 从增量队列中取数据
+            s.HandleDeltas
+              s.indexer.Add/Update/Delete // 将数据写入informer的本地localstore并建立索引
+              s.processor.distribute      // 通知所有ResourceEventHandler Goroutine
+                listener.add
+                  p.addCh <- notification
+
+func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error          
+
+=== 令牌桶限流器 ===
+golang.org/x/time/rate/rate.go
+type Limiter struct {
+	limit Limit   // 限流的QPS大小，也即为向令牌桶中注入token的速率
+	burst int     // 令牌桶的大小
+
+	mu     sync.Mutex
+	tokens float64 // 当前令牌桶中的可用令牌个数
+	// last is the last time the limiter's tokens field was updated
+	last time.Time
+	// lastEvent is the latest time of a rate-limited event (past or future)
+	lastEvent time.Time
+}
+
+AllowN/ReserveN/WaitN
+  lim.reserveN // 根据注入token速率(QPS)，上一次令牌桶余量token更新时间和now的间隔，以及当前令牌桶余量token, 计算申请N个令牌需要等待的时间
+    // A Reservation holds information about events that are permitted by a Limiter to happen after a delay.
+    // A Reservation may be canceled, which may enable the Limiter to permit additional events.
+    type Reservation struct {
+      ok        bool
+      lim       *Limiter
+      tokens    int
+      timeToAct time.Time
+      // This is the Limit at reservation time, it can change later.
+      limit Limit
+    }
+
+=== LeaderElector ===
+LeaseDuration: 主节点在这个时间间隔没有renew就认为主已经crash了, 将发生主备切换
+RetryPeriod: 主renew/备tryAcquire时间间隔
+RenewDeadline: 如果主renew操作消耗时间超过该值，将放弃循环renew操作(相当于弃主)，and if config.ReleaseOnCancel == ture 将立即弃主
+
+=== Pod Terminated ===
+// IsPodTerminated checks if pod is terminated
+func IsPodTerminated(pod *v1.Pod, podStatus v1.PodStatus) bool {
+	return podStatus.Phase == v1.PodFailed || podStatus.Phase == v1.PodSucceeded || (pod.DeletionTimestamp != nil && notRunning(podStatus.ContainerStatuses))
+}
+
+// notRunning returns true if every status is terminated or waiting, or the status list
+// is empty.
+func notRunning(statuses []v1.ContainerStatus) bool {
+	for _, status := range statuses {
+		if status.State.Terminated == nil && status.State.Waiting == nil {
+			return false
+		}
+	}
+	return true
+}
+
+===== mutating & validating =====
+k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/plugin.go
+k8s.io/kubernetes/vendor/k8s.io/apiserver/pkg/admission/plugin/webhook/validating/plugin.go
+
+===== AttachDetachController与Kubelet VolumeManager设计思想 =====
+kubelet在mount之前需要确认，volume已经被attach，是通过node上Status.VolumesAttached(adcontroller会在attachvolume之后updatenode)来判断的
+adcontroller在detach之前需要确认volume已经unmount了，是通过node上的Status.VolumesInUse(kubelet定期更新)来判断
+
+===== Deployment Controller =====
+list & watch
+1. Deployment
+1.1 Create Event:
+
+===== kubeclient 限流 =====
+func (r *Request) tryThrottle()
+Throttling request took
+
+===== 索引 =====
+// Indexers maps a name to a IndexFunc
+type Indexers map[string]IndexFunc
+
+// IndexFunc knows how to provide an indexed value for an object.
+type IndexFunc func(obj interface{}) ([]string, error)
+
+AddIndexers
+
+===== 编译 =====
+make all WHAT=cmd/kube-apiserver
+
+export KUBE_GIT_VERSION=v1.12.0
+make kubelet
