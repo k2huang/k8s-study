@@ -1,0 +1,66 @@
+
+=== dynamic admission webhook ===
+k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook
+k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/admission/configuration/mutating_webhook_manager.go
+
+
+=== list-watch ===
+k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/installer.go
+registerResourceHandlers
+  restfulListResource
+    serveWatch
+    r.List
+      func (c *Cacher) List
+        c.watchCache.WaitUntilFreshAndList
+
+
+k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go
+k8s.io/kubernetes/pkg/registry/core/pod/storage/storage.go
+k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go
+k8s.io/apiserver/pkg/storage/cacher/watch_cache.go
+
+
+list & watch请求被rest.Storage代理，而rest.Storage被cacher.Cacher代理 而cacher.Cacher被cacher.watchCache代理
+rest.Storage
+  rest.Lister 
+  rest.Watcher
+cacher.Cacher
+
+watch触发路径
+etcd put/delete事件 -> cacher.Cacher reflector.ListAndWatch到之后通过cacher.watchCache的add/update/delete
+(watchCache#processEvent)将Event放置到cacher.watchCache中（eventHandler#processEvent） ->  cacher.dispatchEvents将Event分发给所有
+cacheWatcher（add: c.input <- event） -> cacheWatcher#process sendWatchCacheEvent+转发到 c.result，serveWatch goroutine将其
+推送到客户端
+Note: 客户端在发起watch时，如果指定的resourceVersion比watchCache最旧的版本还老时watchapi就直接返回错误
+    if resourceVersion < oldest-1 {
+		return nil, errors.NewResourceExpired(fmt.Sprintf("too old resource version: %d (%d)", resourceVersion, oldest-1))
+	}
+
+add/update/delete路径
+restfulCreateResource
+restfulUpdateResource
+restfulDeleteResource
+委托给cacher.Cacher Create/GuaranteedUpdate/Delete函数 -> etcd storage
+  
+patch路径
+restfulPatchResource
+  func (e *Store) Update( 
+    GuaranteedUpdate
+
+
+优化
+https://github.com/kubernetes/kubernetes/pull/85445
+StorageWithCacher
+
+
+# bookmark机制原理？
+https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/20190206-watch-bookmark.md
+
+
+# PartialObjectMetadata
+https://github.com/kubernetes/client-go/commit/0eaec696666d68ebbaa88494f67298091b3026af
+https://github.com/kubernetes/kubernetes/pull/71548/commits/3230a0b4fd14a6166f8362d4732e199e8779c426
+在server端list或者推送watch数据是通过transformObject函数将某一个资源对象转换为PartialObjectMetadata对象
+
+# NodeAuthorizer
+限制单机kubelet上对资源对象的访问能力
