@@ -1,0 +1,185 @@
+### kubelet overview
+1. API 服务
+10250 端口暴露 kubelet 的 API 服务
+10255 端口暴露只读服务
+4194 端口暴露 cAdvisor 监控采集数据的端口
+10248 暴露 kubelet 健康检查服务
+
+2.syncLoop
+此函数是 kubelet 核心处理函数。此函数监听 Pod 的状态变化然后做出相应的动作。比如：
+容器挂掉的时候更新 Pod 的状态
+创建 Pod 的时候创建一系列的容器、Volume等资源
+
+核心子函数 - syncLoopIteration
+
+3.子模块
+PLEG 负责实时监听 Pod 的容器状态。如果容器状态有变化就发起一个事件，syncLoop 主循环处理此事件
+klet.pleg = pleg.NewGenericPLEG(klet.containerRuntime, plegChannelCapacity, plegRelistPeriod, klet.podCache, clock.RealClock{})
+kl.pleg.Start()
+
+  func (g *GenericPLEG) Start() {
+    go wait.Until(g.relist, g.relistPeriod, wait.NeverStop)
+  }
+
+StatusManger 同步Pod的状态到kube-apiserver
+klet.podManager = kubepod.NewBasicPodManager(kubepod.NewBasicMirrorClient(klet.kubeClient), secretManager, configMapManager, checkpointManager)
+klet.statusManager = status.NewManager(klet.kubeClient, klet.podManager, klet, klet.getRuntime, klet.podCache)
+kl.statusManager.Start
+所有该kubelet管理的Pod的status的更新都会聚合到这里做更新
+
+ProbeManager 定期对 Pod 进行健康检查 ==> prober.NewManager
+为每一个Pod中的每一个Container的 readinessProbe起一个Goroutine, livenessProbe起一个Goroutine
+- readiness的结果通过StatusManger写回到kube-apiserver (m.updateReadiness)
+- liveness的结果同步到 syncLoop (case update := <-kl.livenessManager.Updates())
+
+VolumeManager 负责维护 Pod 的 volume ==> kl.volumeManager.Run
+reconcile该node上要attach/detach && mount/unmount的volumes
+
+PodWorker 响应Pod增、删、改等事件
+真正调用 klet.syncPod 维持Pod终态的，一个Pod一个Goroutine
+
+ContainerGC 定期删除无用的 container
+ImageGC 定期删除无用的 Image
+  kubecontainer.NewContainerGC
+  images.NewImageGCManager
+
+  k.StartGarbageCollection()
+    kl.containerGC.GarbageCollect()
+      m.containerGC.GarbageCollect
+    kl.imageManager.GarbageCollect()
+    https://yuque.antfin-inc.com/asidocs/xg2eea/kwf5l1#669f84b2
+
+ConfigmapManager 负责维护 Pod 的 configMap
+cAdvisor 此服务定期采集 Node 的资源情况
+EvictionManager 根据 Node 资源剩余情况对 Pod 进行驱逐
+CpuManager 负责管理和分配 Node 的 CPU 给 Pod
+GPU Manager 管理 Node 的 GPU
+
+4.ContainerRuntimeInterface
+容器操作接口，现在支持 Docker、RKT 和 Remote Container Manager 三种，不过最常用的还是 Docker 模式
+
+### 源码
+kubelet.go
+=== 启动过程 ===
+func main()
+  NewKubeletCommand
+    Run
+      run
+        RunKubelet
+          CreateAndInitKubelet
+            kubelet.NewMainKubelet
+              dockershim.NewDockerService
+          startKubelet
+            func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) 
+              go wait.Until(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency, wait.NeverStop)
+                syncNodeStatus
+                  registerWithAPIServer ### 注册node
+                    initialNode
+                    tryRegisterWithAPIServer
+                  updateNodeStatus ### 定时上报状态
+                    tryUpdateNodeStatus
+                      setNodeStatus
+                        defaultNodeStatusFuncs
+
+=== 创建Pod过程 ===
+func (kl *Kubelet) syncLoop
+  syncLoopIteration
+    HandlePodAdditions
+      podManager.AddPod(pod)
+      canAdmitPod(activePods, pod) - (NewMainKubelet - NewPredicateAdmitHandler)
+        func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult // kubelet二次校验资源
+      dispatchWork(pod, kubetypes.SyncPodCreate, mirrorPod, start)
+        podWorkers.UpdatePod
+            go managePodLoop
+              func (kl *Kubelet) syncPod(o syncPodOptions) error
+                volumeManager.WaitForAttachAndMount(pod)
+                containerRuntime.SyncPod
+                  createPodSandbox
+                    runtimeService.RunPodSandbox ==(grpc)==> func (ds *dockerService) RunPodSandbox(ctx context.Context, r    
+                      *runtimeapi.RunPodSandboxRequest) (*runtimeapi.RunPodSandboxResponse, error)
+                    startContainer
+                      m.generateContainerConfig
+                      runtimeService.CreateContainer
+
+NewMainKubelet
+  makePodSourceConfig
+    if kubeDeps.KubeClient != nil {
+      glog.Infof("Watching apiserver")
+      if updatechannel == nil {
+        updatechannel = cfg.Channel(kubetypes.ApiserverSource)
+      }
+      config.NewSourceApiserver(kubeDeps.KubeClient, nodeName, updatechannel)
+    }
+
+=== Pod Container 挂掉处理流程 ===
+func (g *GenericPLEG) relist()  // 获取当前所有 Pod 的信息然后和缓存中的信息做 diff，如果发现有变化就触发相应的事件
+  computeEvents
+    generateEvents
+  g.eventChannel <- events[i]
+  syncLoopIteration <- g.eventChannel
+    handler.HandlePodSyncs([]*v1.Pod{pod})
+      dispatchWork(pod, kubetypes.SyncPodSync, mirrorPod, start)
+
+
+=== VolumeManager ===
+desiredStateOfWorld: volume到podToMount的对应关系
+actualStateOfWorld: volume到mountedPod的对应关系
+
+NewMainKubelet
+  klet.volumeManager = volumemanager.NewVolumeManager
+func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate)
+  go kl.volumeManager.Run(kl.sourcesReady, wait.NeverStop)
+    go vm.desiredStateOfWorldPopulator.Run(sourcesReady, stopCh)
+      findAndAddNewPods # 根据bound到node的pod的spec，计算新的pod的volume信息到desiredStateOfWorld
+      findAndRemoveDeletedPods # 根据volume的期望状态，结合pod的运行状态决定是否要将pod从desiredStateOfWorld中去掉
+    go vm.reconciler.Run(stopCh)
+      func (rc *reconciler) reconcile()
+        rc.operationExecutor.UnmountVolume if ...
+          GenerateUnmountVolumeFunc
+            mounter.CleanSubPaths
+            volumeUnmounter.TearDown()
+              TearDownAt ==(grpc)==> csi.NodeUnpublishVolume
+        rc.operationExecutor.MountVolume if ...
+          GenerateMountVolumeFunc
+            volumeDeviceMounter.MountDevice ==(grpc)==> csi.NodeStageVolume: 同一个PV在一个node上globallyMounted只会做一次
+            volumeMounter.SetUp ==(grpc)==> csi.NodePublishVolume
+        rc.operationExecutor.UnmountDevice if ...
+          GenerateUnmountDeviceFunc
+            volumeDeviceUmounter.UnmountDevice ==(grpc)==> csi.NodeUnstageVolume
+
+
+=== kubelet中对container console log的轮转实现 ===
+k8s.io/kubernetes/pkg/kubelet/logs/container_log_manager.go
+// LogRotatePolicy is a policy for container log rotation. The policy applies to all
+// containers managed by kubelet.
+type LogRotatePolicy struct {
+	// MaxSize in bytes of the container log file before it is rotated. Negative
+	// number means to disable container log rotation.
+	MaxSize int64
+	// MaxFiles is the maximum number of log files that can be present.
+	// If rotating the logs creates excess files, the oldest file is removed.
+	MaxFiles int
+}
+1. kubelet定时遍历node上的所有容器
+2. 如果容器console日志文件 > MaxSize, 轮转日志文件
+3. c.runtimeService.ReopenContainerLog
+
+=== eviction manager ===
+// eviction_manager.go
+
+// setup eviction manager
+klet.resourceAnalyzer = serverstats.NewResourceAnalyzer(klet, kubeCfg.VolumeStatsAggPeriod.Duration)
+
+evictionManager, evictionAdmitHandler := eviction.NewManager(klet.resourceAnalyzer, evictionConfig, killPodNow(klet.podWorkers, kubeDeps.Recorder), klet.podManager.GetMirrorPodByPod, klet.imageManager, klet.containerGC, kubeDeps.Recorder, nodeRef, klet.clock)
+klet.evictionManager = evictionManager
+kl.evictionManager.Start(kl.StatsProvider, kl.GetActivePods, kl.podResourcesAreReclaimed, evictionMonitoringPeriod)
+  m.synchronize
+    m.summaryProvider.Get(updateStats)
+      sp.provider.ListPodStats()
+      
+func (m *managerImpl) localStorageEviction(summary *statsapi.Summary, pods []*v1.Pod)
+func (m *managerImpl) evictPod(pod *v1.Pod, gracePeriodOverride int64, evictMsg string, annotations map[string]string) bool
+
+
+func (m *manager) syncPod(uid types.UID, status versionedPodStatus)
+m.canBeDeleted
