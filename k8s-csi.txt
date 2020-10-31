@@ -1,0 +1,223 @@
+// 插件注册
+ProbeVolumePlugins
+  csi.ProbeVolumePlugins
+NewInitializedVolumePluginMgr
+NewOperationExecutor
+
+newCsiDriverClient
+  csiDrivers.Get
+
+Kubelet#KubeletPluginsWatcher
+src/k8s.io/kubernetes/pkg/kubelet/util/pluginwatcher/plugin_watcher.go
+klet.pluginWatcher = pluginwatcher.NewWatcher(klet.getPluginsDir())
+kl.pluginWatcher.AddHandler("CSIPlugin", pluginwatcher.PluginHandler(csi.PluginHandler))
+func (w *Watcher) handleCreateEvent(event fsnotify.Event) error
+  func (w *Watcher) handlePluginRegistration(socketPath string) error {
+
+driver-registrar
+1. call the method <IdentityServer::GetPluginInfo> to get csi driver name via uds~</var/lib/kubelet/plugins/<drivername.example.com>/csi.sock>
+2. "kubernetes-register" mode:
+   - a: register CSIDriver CRD
+   - b: loop for creating [CSIDriver] resource object per 2 mins 
+   - c: delete [CSIDriver] resource object if<收到中断信号>
+   "node-register" mode:
+   - a: get node name from env - "KUBE_NODE_NAME"
+   - b: call the <NodeServer::NodeGetInfo> to get node id via uds~</var/lib/kubelet/plugins/<drivername.example.com>/csi.sock>
+   - c: if *kubeletRegistrationPath != "" {
+          start Registration Server via uds~</var/lib/kubelet/plugins_registry/<drivername.example.com>-reg.sock>
+          - GetInfo: get plugin info for communication later
+          - NotifyRegistrationStatus：
+        } else {
+          add one key-value pair into node annotation, such as `csi.volume.kubernetes.io/nodeid: '{"com.alibaba-inc.csi.sigma-ultron":"214627314-c"}'`
+        }
+3. uds plugin 通信机制
+a. core-system inofity(watch) the plugin-reg-dir, such as </var/lib/kubelet/plugins_registry>
+b. the plugin create uds file in plugin-reg-dir during bootup and start one server listening it
+c. core-system watch new uds file and start get plugin info as client, and then core-system can interact with plugin
+exception case:
+if core-system restart or upgrade:
+walk through the plugin directory discover any existing plugin sockets during bootup
+if plugin restart or upgrade:
+delete old uds file and create new uds file, then core-system will discover the plugin again and handle as a new plugin
+
+=== create/delete volume ===
+0. PVCProtectionFinalizer
+1. pvc对象create/delete时有user来管理
+2. pv对象create/delete是由external-provisioner来管理
+3. pvc与pv的bound以及release的操作是由内置PersistentVolumeController来管理
+
+delete pvc流程
+1.内置PersistentVolumeController
+  claimWorker
+    ctrl.deleteClaim
+      ctrl.claims.Delete(claim)
+        ctrl.volumeQueue.Add(volumeName)
+  volumeWorker
+    keyObj, quit := ctrl.volumeQueue.Get()
+    ctrl.updateVolume
+      ctrl.syncVolume
+        ctrl.updateVolumePhase -> released
+2.external-provisioner(ProvisionController)
+  runVolumeWorker
+      ctrl.deleteVolumeOperation
+        ctrl.provisioner.Delete
+        ctrl.client.CoreV1().PersistentVolumes().Delete
+
+=== attach/detach volume ===
+对于Desired Status主要按照一个node对应多个volume，一个volume对应多个pod的关系进行模型存储，然后根据API接口中node，pod的增删提供相应的接口。
+type desiredStateOfWorld struct {
+	// nodesManaged is a map containing the set of nodes managed by the attach/
+	// detach controller. The key in this map is the name of the node and the
+	// value is a node object containing more information about the node.
+	nodesManaged map[k8stypes.NodeName]nodeManaged
+	// volumePluginMgr is the volume plugin manager used to create volume
+	// plugin objects.
+	volumePluginMgr *volume.VolumePluginMgr
+	sync.RWMutex
+}
+
+对于Actual Status则是从一个volume attach到哪些node，接口也根据业务需要进行了复杂的定义。
+type actualStateOfWorld struct {
+	// attachedVolumes is a map containing the set of volumes the attach/detach
+	// controller believes to be successfully attached to the nodes it is
+	// managing. The key in this map is the name of the volume and the value is
+	// an object containing more information about the attached volume.
+	attachedVolumes map[v1.UniqueVolumeName]attachedVolume
+
+	// nodesToUpdateStatusFor is a map containing the set of nodes for which to
+	// update the VolumesAttached Status field. The key in this map is the name
+	// of the node and the value is an object containing more information about
+	// the node (including the list of volumes to report attached).
+	nodesToUpdateStatusFor map[types.NodeName]nodeToUpdateStatusFor
+
+	// volumePluginMgr is the volume plugin manager used to create volume
+	// plugin objects.
+	volumePluginMgr *volume.VolumePluginMgr
+
+	sync.RWMutex
+}
+
+- 在AD controller中有对pv是否能多node上挂载有判断(attachDesiredVolumes)
+- Node .status.volumesAttached是由ADController更新(nodeStatusUpdater.UpdateNodeStatuses)
+
+func (adc *attachDetachController) Run(stopCh <-chan struct{})
+  go adc.reconciler.Run(stopCh)
+    wait.Until(rc.reconciliationLoopFunc(), rc.loopPeriod, stopCh)
+       rc.reconcile()
+         rc.attacherDetacher.DetachVolume
+         func (rc *reconciler) attachDesiredVolumes()
+           rc.attacherDetacher.AttachVolume
+             
+func (c *csiAttacher) Attach(spec *volume.Spec, nodeName types.NodeName) (string, error)
+- c.k8s.StorageV1beta1().VolumeAttachments().Create(attachment)
+func (c *csiAttacher) Detach(volumeName string, nodeName types.NodeName) error
+- c.k8s.StorageV1beta1().VolumeAttachments().Delete(attachID, nil)  
+
+
+=== Volume Topology-aware Scheduling ===
+### 设计文档
+https://github.com/kubernetes/community/blob/master/contributors/design-proposals/storage/volume-topology-scheduling.md
+
+核心：为了使用某一个PV，Pod必须调度到可以访问到PV的node上，而PV NodeAffinity限制了其PV可以被哪些node访问
+
+### 先有Pod+PVC动态Provision PVC对象
+1. StorageClass.BindingMode = WaitForFirstConsumer
+2. StorageClass.AllowedTopologies
+
+### 先有PV且PV上NodeAffinity限制，scheduler过滤node的过程
+- 如果pod中pvc已经处在bound状态，check node的labels是否与pv nodeAffinity限制能匹配，如果不能，该node不可调度。
+- 如果pod中pvc处在unbound状态, 为pvc找到匹配pv列表，然后check node的labels是否与所有pv nodeAffinity限制能匹配，如果不能，再找到pvc
+中声明的storageclass，check node labels是否能满足storageclass中的AllowedTopologies的限制，如果也不能该node不可调度
+
+### PVC和PV已经bound到一起，在调度使用该PVC的Pod时还会受到PV NodeAffinity的限制吗？
+会。预选过程：
+// Fit is determined by volume topology requirements.
+factory.RegisterFitPredicateFactory(
+    predicates.CheckVolumeBindingPred,
+    func(args factory.PluginFactoryArgs) predicates.FitPredicate {
+        return predicates.NewVolumeBindingPredicate(args.VolumeBinder)
+    },
+)
+
+### delay binding的好处
+如果不延时bind pvc和pv，pvc和pv会在pod调度决策之前先bound, 虽然scheduler在选择node时会check node是否满足bound的pv的nodeAffinity, 但
+这时就只能根据bound pv查找合适的node，可能满足条件的node会变得很少, 因为可以match pvc的pv可能有多个，只选择best match的pv，就会限制住可使用
+的node。
+如果延时binding，scheduler可以先将所有满足pvc的pv列表，然后在check node的列表中pv的nodeAffinity是否有匹配的，可选的node将会变的更多。
+
+### scheduler中重要函数
+// FindPodVolumes checks if all of a Pod's PVCs can be satisfied by the node.
+//
+// If a PVC is bound, it checks if the PV's NodeAffinity matches the Node.
+// Otherwise, it tries to find an available PV to bind to the PVC.
+//
+// It returns true if all of the Pod's PVCs have matching PVs or can be dynamic provisioned,
+// and returns true if bound volumes satisfy the PV NodeAffinity.
+//
+// This function is called by the volume binding scheduler predicate and can be called in parallel
+FindPodVolumes(pod *v1.Pod, node *v1.Node) (unboundVolumesSatisified, boundVolumesSatisfied bool, err error)
+
+// AssumePodVolumes will:
+// 1. Take the PV matches for unbound PVCs and update the PV cache assuming
+// that the PV is prebound to the PVC.
+// 2. Take the PVCs that need provisioning and update the PVC cache with related
+// annotations set.
+//
+// It returns true if all volumes are fully bound
+//
+// This function will modify assumedPod with the node name.
+// This function is called serially.
+AssumePodVolumes(assumedPod *v1.Pod, nodeName string) (allFullyBound bool, err error)
+
+// BindPodVolumes will:
+// 1. Initiate the volume binding by making the API call to prebind the PV
+// to its matching PVC.
+// 2. Trigger the volume provisioning by making the API call to set related
+// annotations on the PVC
+// 3. Wait for PVCs to be completely bound by the PV controller
+//
+// This function can be called in parallel.
+BindPodVolumes(assumedPod *v1.Pod) error
+
+
+=== Volume Finalizer ===
+PV:
+- external-attacher/*
+  add: csi-attacher在volume attach的过程中(before real attach)
+  del: csi-attacher发现PV DeletionTimestamp非空且相关的VA已经不存在才能被删除
+VA:
+- external-attacher/*
+  add: csi-attacher在volume attach的过程中(before real attach)
+  del: csi-attacher在volume被成功detach之后
+
+===== 问题 =====
+1. 使用了远程盘的pod如何保证会调度到已经安装了csi node plugin插件的node上？
+2. csinodeinfo何时会被删掉？
+
+===== bind pvc && pv =====
+dynamic pv
+provisioner为动态创建的pv添加ClaimRef
+
+static pv
+Immediate： pvcontroller find matached pv并在bind上为pv添加ClaimRef
+WaitForFirstConsumer: scheduler find matached pv，为pv添加ClaimRef，然后通过update pv来触发pvcontroller做bind操作
+
+
+==== Volume Expand ====
+	// Ability to Expand persistent volumes
+	ExpandPersistentVolumes featuregate.Feature = "ExpandPersistentVolumes"
+	// Ability to expand persistent volumes' file system without unmounting volumes.
+	ExpandInUsePersistentVolumes featuregate.Feature = "ExpandInUsePersistentVolumes"
+	// Ability to expand CSI volumes
+	ExpandCSIVolumes featuregate.Feature = "ExpandCSIVolumes"
+
+controller
+修改PVC spec size -> csi resizer contoller -> ControllerExpandVolume -> cloud open api
+
+node offline
+delete && create Pod -> kubelet MountVolume -> MountDevice -> NodeStageVolume
+                                            -> NodeExpandVolume resizefs
+
+node online
+kubelet reconcile rc.actualStateOfWorld.PodExistsInVolume return fsResizeRequiredError
+  -> rc.operationExecutor.ExpandInUseVolume -> og.doOnlineExpansion
