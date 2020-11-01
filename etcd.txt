@@ -1,0 +1,9 @@
+
+https://github.com/etcd-io/etcd/pull/9869?spm=ata.13261165.0.0.5898787bLlKydq
+
+https://github.com/etcd-io/etcd/blob/master/Documentation/learning/design-client.md?spm=ata.13261165.0.0.5898787bLlKydq&file=design-client.md
+
+progress_notify is set so that the etcd server will periodically send a WatchResponse with
+no events to the new watcher if there are no recent events. It is useful when clients
+wish to recover a disconnected watcher starting from a recent known revision.
+The etcd server may decide how often it will send notifications based on current load.
