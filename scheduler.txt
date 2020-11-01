@@ -1,0 +1,48 @@
+###
+一个node上已经调度了多少个Pod的资源记账(allocated)是维护在kube-scheduler的内存中的，并未持久化到etcd中，
+因此每次scheduler重启都需要重新计算一次node allocated资源
+
+=== scheduler中单个Pod选择合适的宿主机逻辑 ===
+func (sched *Scheduler) scheduleOne() {
+  ...
+  sched.assumeVolumes(assumedPod, suggestedHost)
+  	// AssumePodVolumes will:
+    // 1. Take the PV matches for unbound PVCs and update the PV cache assuming
+    // that the PV is prebound to the PVC.
+    // 2. Take the PVCs that need provisioning and update the PVC cache with related
+    // annotations set.
+    sched.config.VolumeBinder.Binder.AssumePodVolumes(assumed, host)
+      metav1.SetMetaDataAnnotation(&claimClone.ObjectMeta, annSelectedNode, nodeName)
+  ...
+
+  sched.bindVolumes(assumedPod)
+    // BindPodVolumes will:
+    // 1. Initiate the volume binding by making the API call to prebind the PV
+    // to its matching PVC.
+    // 2. Trigger the volume provisioning by making the API call to set related
+    // annotations on the PVC
+    // 3. Wait for PVCs to be completely bound by the PV controller
+    //
+    // This function can be called in parallel.
+    sched.config.VolumeBinder.Binder.BindPodVolumes(assumed)
+  ...
+
+    err := sched.bind(assumedPod, &v1.Binding{
+    ObjectMeta: metav1.ObjectMeta{Namespace: assumedPod.Namespace, Name: assumedPod.Name, UID: assumedPod.UID},
+    Target: v1.ObjectReference{
+      Kind: "Node",
+      Name: suggestedHost,
+    },
+  })
+  ...
+}
+
+=== 旧的volume scheduling limit ===
++++ k8s.io/kubernetes/pkg/scheduler/algorithmprovider/defaults/register_predicates.go
+	factory.RegisterFitPredicateFactory(
+		predicates.MaxCSIVolumeCountPred,
+		func(args factory.PluginFactoryArgs) predicates.FitPredicate {
+			return predicates.NewCSIMaxVolumeLimitPredicate(args.PVInfo, args.PVCInfo, args.StorageClassInfo)
+		},
+	)
+  
